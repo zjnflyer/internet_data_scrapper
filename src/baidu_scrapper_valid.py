@@ -16,11 +16,13 @@ import os
 import re
 import pandas as pd
 import hashlib
+import random
 # Add imports for image processing
 from io import BytesIO
 from PIL import Image
 from .config import (
-    IMAGES_PER_PARK,
+    IMAGES_PER_SEASON,
+    IMAGES_PER_COVER,
     DATA_FILE_PATH,
     REQUEST_TIMEOUT,
     BAIDU_RESULTS_PER_PAGE,
@@ -28,9 +30,17 @@ from .config import (
     LANDSCAPE_FEATURES,
     DEFAULT_KEYWORD_SUFFIX,
     MAX_FEATURES_IN_KEYWORD,
-    # Import new config variables
-    MIN_RESOLUTION,
-    ASPECT_RATIO_RANGE
+    SEASONS,
+    COVER_KEYWORD_SUFFIXES,
+    # Import image filtering settings
+    SEASON_MIN_RESOLUTION,
+    SEASON_ASPECT_RATIO_RANGE,
+    COVER_MIN_RESOLUTION,
+    COVER_ASPECT_RATIO_RANGE,
+    # Import similarity settings
+    PHASH_THRESHOLD,
+    CHECK_IMAGE_SIZE,
+    CHECK_MD5_HASH
 )
 
 def extract_key_features(description):
@@ -44,18 +54,44 @@ def extract_key_features(description):
             features.append(feature)
     return features
 
-def generate_search_keyword(park_name, description):
+def generate_search_keyword(park_name, description, season):
     """
-    生成优化的搜索关键词
+    生成优化的搜索关键词，包含季节信息
+    
+    Args:
+        park_name (str): 公园名称
+        description (str): 公园描述
+        season (str): 季节 ('春', '夏', '秋', '冬')
     """
     features = extract_key_features(description)
     if features:
         # Use max features defined in config
         features = features[:MAX_FEATURES_IN_KEYWORD]
-        search_keyword = f"{park_name} 风景 {' '.join(features)}"
+        search_keyword = f"{park_name} {season}季 风景 {' '.join(features)}"
     else:
         # Use default suffix from config
-        search_keyword = f"{park_name} {DEFAULT_KEYWORD_SUFFIX}"
+        search_keyword = f"{park_name} {season}季 {DEFAULT_KEYWORD_SUFFIX}"
+    return search_keyword
+
+def generate_cover_search_keyword(park_name, description):
+    """
+    生成封面图片的优化搜索关键词
+    
+    Args:
+        park_name (str): 公园名称
+        description (str): 公园描述
+    """
+    features = extract_key_features(description)
+    # 随机选择一个封面关键词后缀
+    cover_suffix = random.choice(COVER_KEYWORD_SUFFIXES)
+    
+    if features:
+        # Use max features defined in config
+        features = features[:MAX_FEATURES_IN_KEYWORD]
+        search_keyword = f"{park_name} {' '.join(features)} {cover_suffix}"
+    else:
+        # Use cover suffix
+        search_keyword = f"{park_name} {cover_suffix}"
     return search_keyword
 
 def get_national_parks():
@@ -66,25 +102,35 @@ def get_national_parks():
     df = pd.read_csv(DATA_FILE_PATH)
     return [{'name': row['名称'], 'description': row['描述']} for _, row in df.iterrows()]
 
-def is_image_valid(image_data):
-    """Check if image meets resolution and aspect ratio requirements."""
+def is_image_valid(image_data, is_cover=False):
+    """
+    检查图片是否满足分辨率和宽高比要求
+    
+    Args:
+        image_data (bytes): 图片二进制数据
+        is_cover (bool): 是否是封面图片
+    """
     try:
         img = Image.open(BytesIO(image_data))
         width, height = img.size
 
+        # 根据图片类型选择对应的配置
+        min_resolution = COVER_MIN_RESOLUTION if is_cover else SEASON_MIN_RESOLUTION
+        aspect_ratio_range = COVER_ASPECT_RATIO_RANGE if is_cover else SEASON_ASPECT_RATIO_RANGE
+
         # 1. Resolution Check
-        if MIN_RESOLUTION and MIN_RESOLUTION != (0, 0):
-            if width < MIN_RESOLUTION[0] or height < MIN_RESOLUTION[1]:
-                print(f"Skipping image: Resolution ({width}x{height}) below minimum ({MIN_RESOLUTION[0]}x{MIN_RESOLUTION[1]})")
+        if min_resolution and min_resolution != (0, 0):
+            if width < min_resolution[0] or height < min_resolution[1]:
+                print(f"Skipping image: Resolution ({width}x{height}) below minimum {min_resolution}")
                 return False
 
         # 2. Aspect Ratio Check
-        if ASPECT_RATIO_RANGE:
+        if aspect_ratio_range:
             if height == 0: # Avoid division by zero
                 print("Skipping image: Height is 0")
                 return False 
             aspect_ratio = width / height
-            min_ratio, max_ratio = ASPECT_RATIO_RANGE
+            min_ratio, max_ratio = aspect_ratio_range
             if not (min_ratio <= aspect_ratio <= max_ratio):
                 print(f"Skipping image: Aspect ratio ({aspect_ratio:.2f}) outside range [{min_ratio}-{max_ratio}]")
                 return False
@@ -95,21 +141,95 @@ def is_image_valid(image_data):
         print(f"Error validating image: {e}")
         return False # Treat validation errors as invalid
 
-def get_images_from_baidu(keyword, page_num, save_dir):
+def get_image_features(image_data):
+    """
+    获取图片的特征信息，用于更严格的图片查重
+    
+    Args:
+        image_data (bytes): 图片二进制数据
+    
+    Returns:
+        tuple: (image_hash, perceptual_hash, image_size)
+    """
+    try:
+        # 1. 计算基本的MD5哈希
+        image_hash = hashlib.md5(image_data).hexdigest()
+        
+        # 2. 计算感知哈希 (pHash)
+        img = Image.open(BytesIO(image_data))
+        # 转换为灰度图并调整大小为8x8
+        img = img.convert('L').resize((8, 8), Image.Resampling.LANCZOS)
+        pixels = list(img.getdata())
+        avg = sum(pixels) / len(pixels)
+        # 生成感知哈希值（1表示比平均值大，0表示比平均值小）
+        perceptual_hash = ''.join(['1' if pixel > avg else '0' for pixel in pixels])
+        
+        # 3. 获取图片尺寸
+        image_size = img.size
+        
+        return image_hash, perceptual_hash, image_size
+    except Exception as e:
+        print(f"Error calculating image features: {e}")
+        return None, None, None
+
+def is_similar_image(features1, features2):
+    """
+    判断两张图片是否相似
+    
+    Args:
+        features1 (tuple): 第一张图片的特征 (image_hash, perceptual_hash, image_size)
+        features2 (tuple): 第二张图片的特征 (image_hash, perceptual_hash, image_size)
+    
+    Returns:
+        bool: 如果图片相似返回True，否则返回False
+    """
+    if not features1 or not features2:
+        return False
+        
+    hash1, phash1, size1 = features1
+    hash2, phash2, size2 = features2
+    
+    # 1. 如果启用MD5检查且MD5完全相同，认为是相同图片
+    if CHECK_MD5_HASH and hash1 == hash2:
+        print("图片MD5完全匹配，判定为重复")
+        return True
+    
+    # 2. 检查感知哈希的汉明距离
+    if phash1 and phash2:
+        hamming_distance = sum(c1 != c2 for c1, c2 in zip(phash1, phash2))
+        if hamming_distance <= PHASH_THRESHOLD:
+            print(f"图片感知哈希相似度高（差异值：{hamming_distance}），判定为重复")
+            return True
+    
+    # 3. 如果启用尺寸检查且尺寸完全相同，认为是相同图片
+    if CHECK_IMAGE_SIZE and size1 and size2 and size1 == size2:
+        print("图片尺寸完全相同，判定为重复")
+        return True
+        
+    return False
+
+def get_images_from_baidu(keyword, save_dir, park_image_features, is_cover=False):
     """
     从百度图片抓取指定数量符合要求的不重复图片
+    
+    Args:
+        keyword (str): 搜索关键词
+        save_dir (str): 保存目录
+        park_image_features (list): 该公园已下载图片的特征列表
+        is_cover (bool): 是否是封面图片
     """
     header = HEADERS
     url = 'https://image.baidu.com/search/acjson?'
     n = 0
-    hash_set = set()
     checked_urls = 0 # Keep track of how many URLs we've checked
 
     # Try more pages if needed to find enough valid images
     max_pages_to_check = 5 # Limit how many pages we try
     current_page_num = 0
 
-    while n < IMAGES_PER_PARK and current_page_num < max_pages_to_check:
+    target_count = IMAGES_PER_COVER if is_cover else IMAGES_PER_SEASON
+
+    while n < target_count and current_page_num < max_pages_to_check:
         pn = current_page_num * BAIDU_RESULTS_PER_PAGE
         param = {
             'tn': 'resultjson_com',
@@ -170,29 +290,37 @@ def get_images_from_baidu(keyword, page_num, save_dir):
 
         for image_url in image_url_list:
             checked_urls += 1
-            if n >= IMAGES_PER_PARK:
-                print(f"Reached target of {IMAGES_PER_PARK} images. Checked {checked_urls} URLs total.")
+            if n >= target_count:
+                print(f"Reached target of {target_count} images. Checked {checked_urls} URLs total.")
                 return # Stop outer loop once enough images are found
             
-            print(f"Attempting download ({n+1}/{IMAGES_PER_PARK}): {image_url}")
+            print(f"Attempting download ({n+1}/{target_count}): {image_url}")
             try:
                 image_data = requests.get(url=image_url, headers=header, timeout=REQUEST_TIMEOUT).content
                 
                 # 1. Validate Resolution and Aspect Ratio
-                if not is_image_valid(image_data):
+                if not is_image_valid(image_data, is_cover):
                     continue # Skip if invalid dimensions/ratio
                     
-                # 2. Check for Duplicates (Hash)
-                image_hash = hashlib.md5(image_data).hexdigest()
-                if image_hash in hash_set:
-                    print(f"Skipping duplicate image (hash): {image_url}")
+                # 2. 获取图片特征
+                current_features = get_image_features(image_data)
+                
+                # 3. 检查是否与已下载的图片相似
+                is_duplicate = False
+                for existing_features in park_image_features:
+                    if is_similar_image(current_features, existing_features):
+                        print(f"Skipping similar image: {image_url}")
+                        is_duplicate = True
+                        break
+                
+                if is_duplicate:
                     continue
                     
-                # 3. Save if valid and not duplicate
-                hash_set.add(image_hash)
+                # 4. Save if valid and not duplicate
+                park_image_features.append(current_features)
                 with open(os.path.join(save_dir, f'{n:06d}.jpg'), 'wb') as fp:
                     fp.write(image_data)
-                print(f"Successfully downloaded and saved image {n+1}/{IMAGES_PER_PARK}: {os.path.join(save_dir, f'{n:06d}.jpg')}")
+                print(f"Successfully downloaded and saved image {n+1}/{target_count}: {os.path.join(save_dir, f'{n:06d}.jpg')}")
                 n = n + 1
                 
             except requests.exceptions.RequestException as e:
@@ -202,12 +330,12 @@ def get_images_from_baidu(keyword, page_num, save_dir):
 
         current_page_num += 1 # Move to next page
         
-    if n < IMAGES_PER_PARK:
-        print(f"Warning: Could only download {n}/{IMAGES_PER_PARK} valid images after checking {max_pages_to_check} pages and {checked_urls} URLs.")
+    if n < target_count:
+        print(f"Warning: Could only download {n}/{target_count} valid images after checking {max_pages_to_check} pages and {checked_urls} URLs.")
 
 def download_park_images(park_info, base_dir):
     """
-    下载国家公园的代表性图片
+    下载国家公园的四季和封面代表性图片
     
     Args:
         park_info (dict): 包含公园名称和描述的字典
@@ -215,11 +343,33 @@ def download_park_images(park_info, base_dir):
     """
     park_name = park_info['name']
     print(f"Processing park: {park_name}")
-    search_keyword = generate_search_keyword(park_name, park_info['description'])
-    print(f"Using search keyword: {search_keyword}")
-    save_dir = os.path.join(base_dir, park_name)
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    # page_num is handled internally by get_images_from_baidu now
-    get_images_from_baidu(search_keyword, 1, save_dir) 
-    print(f"Completed downloading for: {park_name}")
+    
+    # 用于存储该公园所有已下载图片的特征
+    park_image_features = []
+    
+    # 首先下载封面图片
+    print(f"Downloading cover photo for: {park_name}")
+    cover_keyword = generate_cover_search_keyword(park_name, park_info['description'])
+    print(f"Using cover search keyword: {cover_keyword}")
+    
+    # 在公园目录下创建封面图片目录
+    cover_dir = os.path.join(base_dir, park_name, 'cover')
+    if not os.path.exists(cover_dir):
+        os.makedirs(cover_dir)
+        
+    get_images_from_baidu(cover_keyword, cover_dir, park_image_features, is_cover=True)
+    print(f"Completed downloading cover photo for: {park_name}")
+    
+    # 为每个季节下载图片
+    for season in SEASONS.keys():
+        print(f"Processing season: {season}")
+        search_keyword = generate_search_keyword(park_name, park_info['description'], season)
+        print(f"Using search keyword: {search_keyword}")
+        
+        # 在公园目录下创建季节子目录
+        season_dir = os.path.join(base_dir, park_name, season)
+        if not os.path.exists(season_dir):
+            os.makedirs(season_dir)
+            
+        get_images_from_baidu(search_keyword, season_dir, park_image_features, is_cover=False)
+        print(f"Completed downloading for {park_name} - {season}季")
