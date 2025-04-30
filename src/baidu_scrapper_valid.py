@@ -96,11 +96,61 @@ def generate_cover_search_keyword(park_name, description):
 
 def get_national_parks():
     """
-    从CSV文件读取国家公园信息
+    从CSV文件读取国家公园信息，并返回完整的DataFrame以及公园信息列表
+    
+    Returns:
+        tuple: (DataFrame, list of dicts) DataFrame是完整的CSV数据，list包含所需的公园信息
     """
     # Use data file path from config
     df = pd.read_csv(DATA_FILE_PATH)
-    return [{'name': row['名称'], 'description': row['描述']} for _, row in df.iterrows()]
+    
+    # 确保新的图片URL列存在
+    for col in ['封面图', '春图', '夏图', '秋图', '冬图']:
+        if col not in df.columns:
+            df[col] = ''
+    
+    # 保存更新后的CSV（如果有新列的话）
+    df.to_csv(DATA_FILE_PATH, index=False)
+    
+    # 返回DataFrame和公园信息列表
+    parks_info = [{'name': row['名称'], 'description': row['描述']} for _, row in df.iterrows()]
+    return df, parks_info
+
+def update_park_image_url(park_name, season, image_url):
+    """
+    更新CSV文件中特定公园的图片URL
+    
+    Args:
+        park_name (str): 公园名称
+        season (str): 季节或'封面'
+        image_url (str): 图片URL
+    """
+    try:
+        df = pd.read_csv(DATA_FILE_PATH)
+        
+        # 确定要更新的列名
+        column_map = {
+            '春': '春图',
+            '夏': '夏图',
+            '秋': '秋图',
+            '冬': '冬图',
+            'cover': '封面图'
+        }
+        
+        column = column_map.get(season)
+        if not column:
+            print(f"Warning: Unknown season/type '{season}'")
+            return
+            
+        # 更新特定公园的图片URL
+        df.loc[df['名称'] == park_name, column] = image_url
+        
+        # 保存更新后的CSV
+        df.to_csv(DATA_FILE_PATH, index=False)
+        print(f"Updated {column} URL for {park_name}")
+        
+    except Exception as e:
+        print(f"Error updating CSV file: {e}")
 
 def is_image_valid(image_data, is_cover=False):
     """
@@ -208,7 +258,7 @@ def is_similar_image(features1, features2):
         
     return False
 
-def get_images_from_baidu(keyword, save_dir, park_image_features, is_cover=False):
+def get_images_from_baidu(keyword, save_dir, park_image_features, park_name, season, is_cover=False):
     """
     从百度图片抓取指定数量符合要求的不重复图片
     
@@ -216,6 +266,8 @@ def get_images_from_baidu(keyword, save_dir, park_image_features, is_cover=False
         keyword (str): 搜索关键词
         save_dir (str): 保存目录
         park_image_features (list): 该公园已下载图片的特征列表
+        park_name (str): 公园名称，用于更新CSV
+        season (str): 季节或'cover'，用于更新CSV
         is_cover (bool): 是否是封面图片
     """
     header = HEADERS
@@ -321,6 +373,11 @@ def get_images_from_baidu(keyword, save_dir, park_image_features, is_cover=False
                 with open(os.path.join(save_dir, f'{n:06d}.jpg'), 'wb') as fp:
                     fp.write(image_data)
                 print(f"Successfully downloaded and saved image {n+1}/{target_count}: {os.path.join(save_dir, f'{n:06d}.jpg')}")
+                
+                # 5. Update CSV with image URL
+                season_key = 'cover' if is_cover else season
+                update_park_image_url(park_name, season_key, image_url)
+                
                 n = n + 1
                 
             except requests.exceptions.RequestException as e:
@@ -357,7 +414,7 @@ def download_park_images(park_info, base_dir):
     if not os.path.exists(cover_dir):
         os.makedirs(cover_dir)
         
-    get_images_from_baidu(cover_keyword, cover_dir, park_image_features, is_cover=True)
+    get_images_from_baidu(cover_keyword, cover_dir, park_image_features, park_name, 'cover', is_cover=True)
     print(f"Completed downloading cover photo for: {park_name}")
     
     # 为每个季节下载图片
@@ -371,5 +428,5 @@ def download_park_images(park_info, base_dir):
         if not os.path.exists(season_dir):
             os.makedirs(season_dir)
             
-        get_images_from_baidu(search_keyword, season_dir, park_image_features, is_cover=False)
+        get_images_from_baidu(search_keyword, season_dir, park_image_features, park_name, season, is_cover=False)
         print(f"Completed downloading for {park_name} - {season}季")
